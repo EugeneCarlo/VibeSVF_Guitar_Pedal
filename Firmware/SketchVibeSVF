@@ -1,0 +1,740 @@
+#include <EEPROM.h>
+
+// Пины подключения
+#define PIN_BYPASS_BUTTON 5      // D5 – кнопка байпаса
+#define PIN_LED_GREEN 4           // D4 – зелёный анод светодиода байпаса
+#define PIN_LED_RED 12            // D12 – красный анод светодиода байпаса
+#define PIN_RELAY 6               // D6 – реле (HIGH – эффект включён)
+
+#define PIN_TAP_BUTTON 9          // D9 – кнопка гейта/тап-темпо
+#define PIN_TAP_LED_GREEN 3       // D3 – зелёный анод светодиода LFO/гейта
+#define PIN_TAP_LED_RED 11        // D11 – красный анод светодиода LFO/гейта
+
+#define PIN_EXT_IN A7             // A7 – вход для гитарного сигнала (триггер/гейт)
+
+#define PIN_POT_ATTACK A0         // Attack/Speed
+#define PIN_POT_DECAY A1          // Decay/Wave
+#define PIN_POT_DEPTH A2          // Depth
+
+#define PIN_OUTPUT 10             // D10 – ШИМ выход на эффект
+
+// Константы времени
+const unsigned long DEBOUNCE_TIME = 50;           // 50 мс антидребезг
+const unsigned long COMBO_HOLD_TIME = 1000;       // 1 сек для переключения режима двумя кнопками
+const unsigned long BYPASS_LONG_PRESS_TIME = 3000; // 3 сек для переключения подрежимов
+const unsigned long BYPASS_EXT_HOLD_TIME = 6000;   // 6 сек для включения/выключения внешнего входа
+
+// Порог для детектирования сигнала на A7 (0-1023) – низкий для гитарного сигнала ~0.1V
+const int EXT_THRESHOLD = 10;
+
+// Константы для фильтрации входного сигнала
+const int EXT_FILTER_SAMPLES = 6;   // количество отсчётов для усреднения
+const unsigned long EXT_GATE_HOLD_TIME = 50; // мс удержания gate-сигнала (для подавления дребезга)
+
+// Яркость дополнительной индикации (5% = 10)
+const int EXT_LED_BRIGHTNESS = 10;
+
+// Режимы работы
+enum Mode { ENVELOPE, LFO };
+Mode currentMode = ENVELOPE;       
+bool effectEnabled = false;        
+bool currentColor = 0;             // 0 – зелёный, 1 – красный (выбранный режим)
+
+// Подрежимы огибающей
+enum EnvSubMode { TRIG, GATE };
+EnvSubMode envSubMode = TRIG;       
+
+// Подрежимы LFO
+enum LfoSubMode { CONTINUOUS, GATED };
+LfoSubMode lfoSubMode = CONTINUOUS; 
+
+// Переменные для кнопки байпаса
+int lastBypassState = HIGH;
+unsigned long bypassPressTime = 0;
+bool bypassWasPressed = false;
+bool bypassLongPressHandled = false; // флаг, что длинное нажатие 3 сек уже обработано
+bool bypassExtLongPressHandled = false; // флаг, что 6 сек обработано
+
+// Переменные для кнопки D9
+int lastTapState = HIGH;
+unsigned long lastTapTime = 0;     
+unsigned long tapInterval = 500;    
+bool tapButtonPressed = false;      
+
+// Переменные для огибающей (AD)
+bool envelopeActive = false;        
+float envAttackTime;                
+float envDecayTime;                 
+int envDepth;                       
+float envCurrentValue = 0;          
+bool gateActive = false;            
+int lastSource = 0;                  // 0 - нет, 1 - кнопка, 2 - внешний вход
+
+// Переменные для режима Trig (простой запуск)
+unsigned long envelopeStartTime;      // время старта для Trig
+
+// Переменные для режима Gate (ретриггер)
+float attackStartValue;              // значение в начале текущей атаки
+unsigned long attackStartTime;       // время начала текущей атаки
+float decayStartValue;               // значение в начале спада
+unsigned long decayStartTime;        // время начала спада
+
+// Переменные для LFO
+unsigned long lfoPeriod = 500;      
+unsigned long lfoLastUpdate = 0;    
+float lfoPhase = 0.0;               
+int lfoWaveform = 0;                
+int lfoDepth;                       
+bool gateLfoActive = false;         
+int lastLfoOutput = 0;              
+
+// Переменные для приоритета ручки скорости
+int lastSpeedRaw = -1;              
+bool manualSpeed = false;           
+
+// Переменные для комбинации двух кнопок
+bool comboActive = false;           
+unsigned long comboStartTime = 0;
+bool comboTriggered = false;        
+
+// Флаг для временного отключения аналоговой индикации (при длительных нажатиях)
+bool ledOverride = false;
+
+// Переменные для внешнего входа A7
+bool extInputEnabled = false;        // включена ли обработка A7
+bool extInputActive = false;         // текущее состояние входа (после фильтрации)
+bool extInputPrev = false;           // предыдущее состояние для детекта фронта
+
+// Переменные для удержания gate-сигнала (режим GATE)
+bool extGateHold = false;            // флаг удержания
+unsigned long extGateHoldStart = 0;  // время последнего сброса удержания
+
+// Фильтр для входного сигнала
+int extFilterBuffer[EXT_FILTER_SAMPLES];
+int extFilterIndex = 0;
+long extFilterSum = 0;
+
+// Структура для хранения в EEPROM
+struct Config {
+  uint32_t magic;      
+  bool effectEnabled;
+  bool currentColor;   
+  bool manualSpeed;    
+  uint16_t tapInterval; 
+  uint8_t envSubMode;   
+  uint8_t lfoSubMode;   
+  bool extInputEnabled; // новое поле
+  uint8_t checksum;
+};
+
+const uint32_t MAGIC = 0xDEADBEEF;
+Config savedConfig;
+
+// Вычисление простой контрольной суммы
+uint8_t computeChecksum(const Config& cfg) {
+  uint8_t sum = 0;
+  const uint8_t* ptr = (const uint8_t*)&cfg;
+  for (size_t i = 0; i < sizeof(Config) - sizeof(uint8_t); i++) {
+    sum ^= ptr[i];
+  }
+  return sum;
+}
+
+// Сохранение конфигурации в EEPROM
+void saveConfig() {
+  Config cfg;
+  cfg.magic = MAGIC;
+  cfg.effectEnabled = effectEnabled;
+  cfg.currentColor = currentColor;
+  cfg.manualSpeed = manualSpeed;
+  cfg.tapInterval = tapInterval;
+  cfg.envSubMode = (uint8_t)envSubMode;
+  cfg.lfoSubMode = (uint8_t)lfoSubMode;
+  cfg.extInputEnabled = extInputEnabled;
+  cfg.checksum = computeChecksum(cfg);
+  
+  EEPROM.put(0, cfg);
+}
+
+// Загрузка конфигурации из EEPROM
+void loadConfig() {
+  Config cfg;
+  EEPROM.get(0, cfg);
+  
+  if (cfg.magic == MAGIC && cfg.checksum == computeChecksum(cfg)) {
+    effectEnabled = cfg.effectEnabled;
+    currentColor = cfg.currentColor;
+    manualSpeed = cfg.manualSpeed;
+    tapInterval = cfg.tapInterval;
+    envSubMode = (EnvSubMode)cfg.envSubMode;
+    lfoSubMode = (LfoSubMode)cfg.lfoSubMode;
+    extInputEnabled = cfg.extInputEnabled;
+    
+    currentMode = (currentColor == 0) ? ENVELOPE : LFO;
+    
+    digitalWrite(PIN_RELAY, effectEnabled ? HIGH : LOW);
+    setBypassLED(effectEnabled);
+    
+    if (currentMode == LFO && !manualSpeed) {
+      lfoPeriod = tapInterval;
+    }
+    
+    lastSpeedRaw = analogRead(PIN_POT_ATTACK);
+  } else {
+    effectEnabled = false;
+    currentColor = 0;
+    currentMode = ENVELOPE;
+    manualSpeed = false;
+    tapInterval = 500;
+    envSubMode = TRIG;
+    lfoSubMode = CONTINUOUS;
+    extInputEnabled = false;
+    
+    digitalWrite(PIN_RELAY, LOW);
+    setBypassLED(false);
+  }
+}
+
+void setup() {
+  // Отладка отключена для предотвращения помех и мигания светодиода TX
+  // Serial.begin(9600);
+  
+  pinMode(PIN_BYPASS_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_TAP_BUTTON, INPUT_PULLUP);
+  
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_TAP_LED_GREEN, OUTPUT);
+  pinMode(PIN_TAP_LED_RED, OUTPUT);
+  
+  pinMode(PIN_RELAY, OUTPUT);
+  pinMode(PIN_OUTPUT, OUTPUT);
+  
+  // Инициализация фильтра для A7
+  for (int i = 0; i < EXT_FILTER_SAMPLES; i++) {
+    extFilterBuffer[i] = 0;
+  }
+  extFilterSum = 0;
+  
+  loadConfig();
+  
+  setTapLED(0);
+  analogWrite(PIN_OUTPUT, 0);
+}
+
+void setBypassLED(bool state) {
+  if (state) {
+    if (currentColor == 0) { // ENVELOPE – красный
+      digitalWrite(PIN_LED_GREEN, LOW);
+      digitalWrite(PIN_LED_RED, HIGH);
+    } else { // LFO – зелёный
+      digitalWrite(PIN_LED_GREEN, HIGH);
+      digitalWrite(PIN_LED_RED, LOW);
+    }
+  } else {
+    digitalWrite(PIN_LED_GREEN, LOW);
+    digitalWrite(PIN_LED_RED, LOW);
+  }
+}
+
+void toggleBypassColor() {
+  currentColor = !currentColor;
+  if (effectEnabled) setBypassLED(true);
+  if (currentColor == 0) {
+    currentMode = ENVELOPE;
+    analogWrite(PIN_OUTPUT, 0);
+    setTapLED(0);
+  } else {
+    currentMode = LFO;
+    lfoPhase = 0;
+    lfoLastUpdate = millis();
+    manualSpeed = false;
+    lastSpeedRaw = analogRead(PIN_POT_ATTACK);
+    gateLfoActive = false;
+    setTapLED(0);
+  }
+  saveConfig();
+}
+
+void setTapLED(int color) {
+  digitalWrite(PIN_TAP_LED_GREEN, (color == 1) ? HIGH : LOW);
+  digitalWrite(PIN_TAP_LED_RED,   (color == 2) ? HIGH : LOW);
+}
+
+// Индикация двойного мигания оранжевым (оба светодиода 20%)
+void indicateExtToggle() {
+  ledOverride = true;
+  for (int i = 0; i < 2; i++) {
+    analogWrite(PIN_TAP_LED_GREEN, EXT_LED_BRIGHTNESS);
+    analogWrite(PIN_TAP_LED_RED, EXT_LED_BRIGHTNESS);
+    delay(200);
+    analogWrite(PIN_TAP_LED_GREEN, 0);
+    analogWrite(PIN_TAP_LED_RED, 0);
+    delay(200);
+  }
+  ledOverride = false;
+}
+
+// Обработка кнопки байпаса с поддержкой 3 сек (подрежим) и 6 сек (extInput)
+void handleBypassButton() {
+  int reading = digitalRead(PIN_BYPASS_BUTTON);
+  static unsigned long lastDebounceTime = 0;
+  
+  if (reading != lastBypassState) {
+    lastDebounceTime = millis();
+  }
+  
+  if ((millis() - lastDebounceTime) > DEBOUNCE_TIME) {
+    if (reading == LOW) {
+      if (!bypassWasPressed) {
+        // Начало нажатия
+        bypassWasPressed = true;
+        bypassPressTime = millis();
+        bypassLongPressHandled = false;
+        bypassExtLongPressHandled = false;
+      } else {
+        unsigned long holdTime = millis() - bypassPressTime;
+        
+        // Обработка 3 сек (переключение подрежима)
+        if (!bypassLongPressHandled && holdTime >= BYPASS_LONG_PRESS_TIME) {
+          bypassLongPressHandled = true;
+          ledOverride = true;
+          
+          if (currentMode == ENVELOPE) {
+            envSubMode = (envSubMode == TRIG) ? GATE : TRIG;
+            saveConfig();
+            setTapLED(0);
+            delay(50);
+            setTapLED(envSubMode == TRIG ? 1 : 2);
+            delay(500);
+            setTapLED(0);
+          } else if (currentMode == LFO) {
+            lfoSubMode = (lfoSubMode == CONTINUOUS) ? GATED : CONTINUOUS;
+            saveConfig();
+            setTapLED(0);
+            delay(50);
+            // для CONTINUOUS мигаем зелёным (1), для GATED красным (2)
+            setTapLED(lfoSubMode == CONTINUOUS ? 1 : 2);
+            delay(500);
+            setTapLED(0);
+          }
+          
+          ledOverride = false;
+        }
+        
+        // Обработка 6 сек (переключение extInputEnabled) – только в режиме ENVELOPE
+        if (currentMode == ENVELOPE && !bypassExtLongPressHandled && holdTime >= BYPASS_EXT_HOLD_TIME) {
+          bypassExtLongPressHandled = true;
+          extInputEnabled = !extInputEnabled;
+          saveConfig();
+          indicateExtToggle(); // двойное мигание оранжевым
+        }
+      }
+    } else {
+      // Кнопка отпущена
+      if (bypassWasPressed) {
+        // Если не было длинных нажатий – короткое нажатие
+        if (!bypassLongPressHandled && !bypassExtLongPressHandled) {
+          effectEnabled = !effectEnabled;
+          digitalWrite(PIN_RELAY, effectEnabled ? HIGH : LOW);
+          setBypassLED(effectEnabled);
+          if (!effectEnabled) {
+            analogWrite(PIN_OUTPUT, 0);
+          }
+          saveConfig();
+        }
+        bypassWasPressed = false;
+        bypassLongPressHandled = false;
+        bypassExtLongPressHandled = false;
+      }
+    }
+  }
+  lastBypassState = reading;
+}
+
+// Запуск огибающей в режиме Trig (с указанием источника)
+void startEnvelopeTrig(int source) {
+  envelopeActive = true;
+  lastSource = source;
+  envelopeStartTime = millis();   // используем отдельную переменную для Trig
+  int attackRaw = analogRead(PIN_POT_ATTACK);
+  int decayRaw = analogRead(PIN_POT_DECAY);
+  int depthRaw = analogRead(PIN_POT_DEPTH);
+  
+  envAttackTime = map(attackRaw, 0, 1023, 1, 5000);
+  envDecayTime = map(decayRaw, 0, 1023, 1, 5000);
+  envDepth = map(depthRaw, 0, 1023, 0, 255);
+}
+
+// Обновление огибающей в режиме Trig
+void updateEnvelopeTrig() {
+  if (!ledOverride) {
+    if (envelopeActive) {
+      unsigned long now = millis();
+      unsigned long elapsed = now - envelopeStartTime; // используем envelopeStartTime
+      
+      float value;
+      if (elapsed < envAttackTime) {
+        value = (elapsed / envAttackTime) * envDepth;
+      } else if (elapsed < envAttackTime + envDecayTime) {
+        float decayElapsed = elapsed - envAttackTime;
+        value = envDepth * (1.0 - (decayElapsed / envDecayTime));
+      } else {
+        envelopeActive = false;
+        value = 0;
+        lastSource = 0;
+      }
+      
+      int pwm = constrain((int)value, 0, 255);
+      analogWrite(PIN_OUTPUT, pwm);
+      analogWrite(PIN_TAP_LED_GREEN, pwm);
+    } else {
+      analogWrite(PIN_TAP_LED_GREEN, 0);
+    }
+  }
+  
+  // Индикация внешнего входа (красный тусклый)
+  if (!ledOverride && extInputEnabled && currentMode == ENVELOPE) {
+    if (extInputActive) {
+      analogWrite(PIN_TAP_LED_RED, EXT_LED_BRIGHTNESS);
+    } else {
+      analogWrite(PIN_TAP_LED_RED, 0);
+    }
+  } else if (!ledOverride) {
+    analogWrite(PIN_TAP_LED_RED, 0);
+  }
+}
+
+// Запуск огибающей в режиме Gate (полный старт с нуля)
+void startEnvelopeGate(int source) {
+  envelopeActive = true;
+  gateActive = true;
+  lastSource = source;
+  
+  int attackRaw = analogRead(PIN_POT_ATTACK);
+  int decayRaw = analogRead(PIN_POT_DECAY);
+  int depthRaw = analogRead(PIN_POT_DEPTH);
+  
+  envAttackTime = map(attackRaw, 0, 1023, 1, 5000);
+  envDecayTime = map(decayRaw, 0, 1023, 1, 5000);
+  envDepth = map(depthRaw, 0, 1023, 0, 255);
+  
+  attackStartValue = 0;
+  attackStartTime = millis();
+  envCurrentValue = 0;
+  decayStartValue = 0;
+}
+
+// Ретриггер в режиме Gate (продолжение атаки с текущего значения)
+void retriggerEnvelopeGate(int source) {
+  // Предполагаем, что envelopeActive == true, gateActive == false
+  lastSource = source;
+  gateActive = true;
+  attackStartValue = envCurrentValue;
+  attackStartTime = millis();
+  // Параметры envAttackTime, envDecayTime, envDepth остаются прежними
+}
+
+// Обновление огибающей в режиме Gate (новая версия)
+void updateEnvelopeGate() {
+  if (!ledOverride) {
+    if (envelopeActive) {
+      unsigned long now = millis();
+      
+      if (gateActive) {
+        // Фаза атаки или удержания
+        unsigned long elapsed = now - attackStartTime;
+        if (elapsed < envAttackTime) {
+          // Атака от attackStartValue до envDepth
+          envCurrentValue = attackStartValue + (elapsed / envAttackTime) * (envDepth - attackStartValue);
+        } else {
+          // Удержание на максимуме
+          envCurrentValue = envDepth;
+        }
+      } else {
+        // Фаза спада
+        unsigned long elapsed = now - decayStartTime;
+        if (elapsed < envDecayTime) {
+          envCurrentValue = decayStartValue * (1.0 - (elapsed / envDecayTime));
+        } else {
+          envelopeActive = false;
+          envCurrentValue = 0;
+          lastSource = 0;
+        }
+      }
+      
+      int pwm = constrain((int)envCurrentValue, 0, 255);
+      analogWrite(PIN_OUTPUT, pwm);
+      analogWrite(PIN_TAP_LED_RED, pwm); // в Gate режиме форма отображается красным
+    } else {
+      analogWrite(PIN_TAP_LED_RED, 0);
+    }
+  }
+  
+  // Индикация внешнего входа (зелёный тусклый)
+  if (!ledOverride && extInputEnabled && currentMode == ENVELOPE) {
+    if (extGateHold) {
+      analogWrite(PIN_TAP_LED_GREEN, EXT_LED_BRIGHTNESS);
+    } else {
+      analogWrite(PIN_TAP_LED_GREEN, 0);
+    }
+  } else if (!ledOverride) {
+    analogWrite(PIN_TAP_LED_GREEN, 0);
+  }
+}
+
+// Обработка кнопки D9 – теперь только устанавливает флаг tapButtonPressed
+void handleTapButton() {
+  int reading = digitalRead(PIN_TAP_BUTTON);
+  static unsigned long lastDebounceTime = 0;
+  
+  if (reading != lastTapState) {
+    lastDebounceTime = millis();
+  }
+  
+  if ((millis() - lastDebounceTime) > DEBOUNCE_TIME) {
+    // Нажатие
+    if (reading == LOW && !tapButtonPressed) {
+      tapButtonPressed = true;
+      
+      if (currentMode == ENVELOPE && envSubMode == TRIG) {
+        // В режиме Trig запускаем сразу, т.к. там нет удержания
+        if (!envelopeActive) {
+          startEnvelopeTrig(1);
+        }
+      } else if (currentMode == LFO) {
+        if (lfoSubMode == CONTINUOUS) {
+          // Тап-темпо
+          unsigned long now = millis();
+          if (lastTapTime != 0) {
+            unsigned long diff = now - lastTapTime;
+            if (diff > 50) {
+              tapInterval = diff;
+              lfoPeriod = tapInterval;
+              manualSpeed = false;
+              saveConfig();
+            }
+          }
+          lastTapTime = now;
+        } else { // GATED
+          gateLfoActive = true;
+          lfoPhase = 0;
+          lfoLastUpdate = millis();
+        }
+      }
+      // В режиме GATE просто устанавливаем флаг, логика запуска в loop
+    }
+    
+    // Отпускание
+    if (reading == HIGH && tapButtonPressed) {
+      if (currentMode == ENVELOPE && envSubMode == GATE) {
+        // Ничего не делаем, флаг снимется
+      } else if (currentMode == LFO && lfoSubMode == GATED) {
+        gateLfoActive = false;
+      }
+      tapButtonPressed = false;
+    }
+  }
+  lastTapState = reading;
+}
+
+// Обновление LFO
+void updateLFO() {
+  int waveRaw = analogRead(PIN_POT_DECAY);
+  lfoWaveform = map(waveRaw, 0, 1023, 0, 3);
+  if (lfoWaveform > 2) lfoWaveform = 2;
+  
+  int depthRaw = analogRead(PIN_POT_DEPTH);
+  lfoDepth = map(depthRaw, 0, 1023, 0, 255);
+  
+  int speedRaw = analogRead(PIN_POT_ATTACK);
+  
+  if (abs(speedRaw - lastSpeedRaw) > 4) {
+    if (!manualSpeed) {
+      manualSpeed = true;
+      saveConfig();
+    }
+    lastSpeedRaw = speedRaw;
+  }
+  
+  unsigned long currentPeriod;
+  if (manualSpeed) {
+    currentPeriod = map(speedRaw, 0, 1023, 5000, 50);
+  } else {
+    if (lastTapTime != 0 && lfoSubMode == CONTINUOUS) {
+      currentPeriod = tapInterval;
+    } else {
+      currentPeriod = map(speedRaw, 0, 1023, 5000, 50);
+    }
+  }
+  
+  unsigned long now = millis();
+  
+  bool updatePhase = false;
+  if (lfoSubMode == CONTINUOUS) {
+    updatePhase = true;
+  } else {
+    updatePhase = gateLfoActive;
+  }
+  
+  if (updatePhase) {
+    unsigned long delta = now - lfoLastUpdate;
+    if (delta >= currentPeriod) {
+      lfoPhase = 0;
+      lfoLastUpdate = now;
+    } else {
+      lfoPhase += (float)delta / currentPeriod;
+      if (lfoPhase >= 1.0) lfoPhase -= 1.0;
+      lfoLastUpdate = now;
+    }
+  }
+  
+  float out;
+  switch (lfoWaveform) {
+    case 0: out = lfoPhase; break;
+    case 1: out = (lfoPhase < 0.5) ? 2*lfoPhase : 2*(1.0-lfoPhase); break;
+    case 2: out = 1.0 - lfoPhase; break;
+    default: out = 0;
+  }
+  
+  int pwm = (int)(out * lfoDepth);
+  
+  if (lfoSubMode == CONTINUOUS || (lfoSubMode == GATED && gateLfoActive)) {
+    lastLfoOutput = pwm;
+  }
+  
+  int outputPwm;
+  if (lfoSubMode == CONTINUOUS) {
+    outputPwm = pwm;
+  } else {
+    outputPwm = gateLfoActive ? pwm : lastLfoOutput;
+  }
+  
+  analogWrite(PIN_OUTPUT, outputPwm);
+  
+  // Индикация LFO
+  if (lfoSubMode == CONTINUOUS) {
+    if (!ledOverride) {
+      analogWrite(PIN_TAP_LED_GREEN, outputPwm);
+      analogWrite(PIN_TAP_LED_RED, 0);
+    }
+  } else { // GATED
+    if (!ledOverride) {
+      if (gateLfoActive) {
+        analogWrite(PIN_TAP_LED_RED, outputPwm);
+        analogWrite(PIN_TAP_LED_GREEN, 0);
+      } else {
+        analogWrite(PIN_TAP_LED_RED, 0);
+        analogWrite(PIN_TAP_LED_GREEN, 0);
+      }
+    }
+  }
+}
+
+// Обработка внешнего входа A7 с фильтрацией и удержанием для режима GATE
+void handleExtInput() {
+  if (!extInputEnabled || currentMode != ENVELOPE) return;
+  
+  // Чтение и обновление скользящего среднего
+  int newSample = analogRead(PIN_EXT_IN);
+  extFilterSum -= extFilterBuffer[extFilterIndex];
+  extFilterBuffer[extFilterIndex] = newSample;
+  extFilterSum += newSample;
+  extFilterIndex = (extFilterIndex + 1) % EXT_FILTER_SAMPLES;
+  
+  int avg = extFilterSum / EXT_FILTER_SAMPLES;
+  bool newState = (avg > EXT_THRESHOLD);
+  
+  extInputActive = newState;
+  
+  // В режиме TRIG используем детект фронта (без изменений)
+  if (envSubMode == TRIG) {
+    if (extInputActive && !extInputPrev) {
+      if (!envelopeActive) {
+        startEnvelopeTrig(2);
+      }
+    }
+  } else { // GATE
+    // Управление удержанием: при наличии сигнала сбрасываем таймер удержания
+    if (extInputActive) {
+      extGateHold = true;
+      extGateHoldStart = millis();
+    }
+    // Проверка таймаута удержания
+    if (extGateHold && (millis() - extGateHoldStart >= EXT_GATE_HOLD_TIME)) {
+      extGateHold = false;
+    }
+    
+    // Детект фронта для ретриггера – убрали прямой вызов startEnvelopeGate
+    // Теперь логика будет в loop
+  }
+  
+  extInputPrev = extInputActive;
+}
+
+void loop() {
+  int bypassReading = digitalRead(PIN_BYPASS_BUTTON);
+  int tapReading = digitalRead(PIN_TAP_BUTTON);
+  
+  // Комбинация двух кнопок
+  if (bypassReading == LOW && tapReading == LOW) {
+    if (!comboActive) {
+      comboActive = true;
+      comboStartTime = millis();
+      comboTriggered = false;
+      bypassWasPressed = false;
+      tapButtonPressed = false;
+    } else {
+      if (!comboTriggered && (millis() - comboStartTime >= COMBO_HOLD_TIME)) {
+        toggleBypassColor();
+        comboTriggered = true;
+        bypassWasPressed = false;
+        tapButtonPressed = false;
+      }
+    }
+  } else {
+    comboActive = false;
+    comboTriggered = false;
+  }
+  
+  if (!comboActive) {
+    handleBypassButton();
+    handleTapButton();
+  }
+  
+  // Обработка внешнего входа
+  handleExtInput();
+  
+  // Обновление генераторов
+  if (currentMode == ENVELOPE) {
+    if (envSubMode == TRIG) {
+      updateEnvelopeTrig();
+    } else { // GATE
+      // Основная логика управления gateActive
+      bool shouldBeActive = tapButtonPressed || extGateHold;
+      if (shouldBeActive) {
+        int source = extGateHold ? 2 : 1; // приоритет внешнего
+        if (!envelopeActive) {
+          // Полный старт с нуля
+          startEnvelopeGate(source);
+        } else if (!gateActive) {
+          // Ретриггер во время спада
+          retriggerEnvelopeGate(source);
+        }
+        // Если уже gateActive, ничего не делаем
+      } else {
+        // Нет активного сигнала – если в атаке/удержании, начинаем спад
+        if (gateActive) {
+          gateActive = false;
+          decayStartValue = envCurrentValue;
+          decayStartTime = millis();
+        }
+      }
+      
+      updateEnvelopeGate();
+    }
+  } else {
+    updateLFO();
+  }
+  
+}
