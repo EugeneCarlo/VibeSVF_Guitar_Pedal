@@ -112,7 +112,6 @@ When toggled, the Tap LED blinks twice dimly.
 ## Settings Saving
 
 All settings (effect state, selected mode, sub‑modes, manual/automatic LFO speed mode, tap‑tempo interval, external input status) are automatically saved to EEPROM 2 seconds after the last change.
-***
 
 
 # VibeFilter — Гибридная педаль эффектов (State Variable Filter) с открытым исходным кодом
