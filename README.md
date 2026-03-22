@@ -1,4 +1,4 @@
-# VibeFilter — Hybrid Effects Pedal (State Variable Filter) with Open Source Code
+# VibeFilter — Hybrid Effects Pedal with Open Source Code
 ![VibeFilter](https://cs19.pikabu.ru/s/2026/03/01/17/ktbuwqn2_lg.png)\
 The project is fully open source: you can replicate the circuit, order PCBs, build the pedal, and modify the firmware to suit your needs.
 
@@ -113,7 +113,7 @@ When toggled, the Tap LED blinks twice dimly.
 All settings (effect state, selected mode, sub‑modes, manual/automatic LFO speed mode, tap‑tempo interval, external input status) are automatically saved to EEPROM 2 seconds after the last change.
 
 
-# VibeFilter — Гибридная педаль эффектов (State Variable Filter) с открытым исходным кодом
+# VibeFilter — Гибридная педаль эффектов с открытым исходным кодом
 
 ---
 
