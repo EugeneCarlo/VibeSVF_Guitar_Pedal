@@ -1,7 +1,7 @@
 # VibeFilter — Hybrid Effects Pedal (State Variable Filter) with Open Source Code
-
-The project is fully open source: you can replicate the circuit, order PCBs, build the pedal, and modify the firmware to suit your needs.
 ![VibeFilter](https://cs19.pikabu.ru/s/2026/03/01/17/ktbuwqn2_lg.png)
+The project is fully open source: you can replicate the circuit, order PCBs, build the pedal, and modify the firmware to suit your needs.
+
 
 ## Architecture
 
