@@ -1,3 +1,120 @@
+# VibeFilter — Hybrid Effects Pedal (State Variable Filter) with Open Source Code
+
+---
+
+The project is fully open source: you can replicate the circuit, order PCBs, build the pedal, and modify the firmware to suit your needs.
+
+## Architecture
+
+- Analog section: State Variable Filter (SVF) based on LM13700.
+- Digital control: Arduino Nano.
+
+## Specifications
+
+- Power supply: single-polarity 9–12 V.
+- Number of analog parameters: 2.
+- Number of digital parameters: 3.
+- Controls: 2 buttons, 2 bi‑color LEDs.
+- True‑bypass (relay).
+
+## Operating Modes
+
+The current firmware offers two main modes, each with two sub‑modes:
+
+**Envelope:**
+- Trig (one‑shot trigger)
+- Gate (hold).
+
+**LFO (Low‑Frequency Oscillator):**
+- Tap‑Tempo (continuous operation)
+- Gated (triggered by press).
+
+## Controls
+
+### Potentiometers (Analog)
+
+- **FREQ** – base filter frequency.
+- **RES** – filter resonance (Q factor).
+
+### Potentiometers (Digital)
+
+- **Attack/Speed**
+  - in Envelope mode: sets attack time.
+  - in LFO mode: modulation speed (when tap‑tempo is not used).
+
+- **Decay/Wave**
+  - in Envelope mode: sets decay time.
+  - in LFO mode: selects waveform.
+
+- **Depth** – effect depth (0–255).
+
+### Buttons
+
+#### Bypass (D5)
+- Short press: toggles effect on/off (relay).
+- Hold (2 sec): switches sub‑mode.
+  - (Trig/Gate in Envelope mode)
+  - (Tap Tempo/Gated in LFO mode)
+- Hold (6 sec): enables/disables external input processing on A7.  
+  Used as an additional trigger/gate source for the envelope and in LFO random mode.
+
+#### Tap/Trigger (D9)
+- in Envelope mode (Trig): triggers the envelope.
+- in Envelope mode (Gate): holds the envelope.
+- in LFO mode (Tap Tempo): sets the tempo.
+- in LFO mode (Gated): starts the LFO.
+
+## Mode Selection
+
+To switch the main mode, press and hold both buttons (Bypass and Tap) for about 1 second.  
+The Bypass LED color changes:
+- Red (Envelope)
+- Green (LFO)
+
+### Envelope Mode
+
+- **Trig (trigger):** the envelope fires once when Tap is pressed or when a signal is received on input A7 (if external input is enabled).  
+  Envelope shape is attack/decay (AD).  
+  Attack and Decay are adjusted with the corresponding potentiometers.  
+  Depth sets the maximum level.
+
+- **Gate (hold):** the envelope rises to maximum as long as Tap is held or the signal on A7 is active (if external input is enabled).  
+  The decay starts after release.  
+  Attack and Decay are adjusted with the corresponding potentiometers.  
+  Depth sets the maximum level.
+
+### LFO Mode
+
+- **Tap Tempo:** the LFO runs continuously.  
+  Speed can be set with the Attack/Speed potentiometer (manual mode) or by tapping Tap twice at the desired interval;  
+  after that, the Speed knob no longer controls the speed (tap‑tempo is active).  
+  To return to manual control, simply turn the Speed knob.
+
+- **Gated:** the LFO stays silent until Tap is pressed.  
+  When pressed, the LFO starts from the beginning of its waveform and runs as long as the button is held.
+
+#### LFO Waveform
+
+The waveform is selected with the Wave knob:
+
+1 – rising sawtooth  
+2 – triangle  
+3 – falling sawtooth  
+4 – 50% square  
+5 – random value (updated every period)
+
+## External Trigger
+
+Enable/disable external input processing in random mode.  
+Hold the Bypass button for 6 seconds.  
+When toggled, the Tap LED blinks twice dimly.
+
+## Settings Saving
+
+All settings (effect state, selected mode, sub‑modes, manual/automatic LFO speed mode, tap‑tempo interval, external input status) are automatically saved to EEPROM 2 seconds after the last change.
+***
+
+
 # VibeFilter — Гибридная педаль эффектов (State Variable Filter) с открытым исходным кодом
 
 ---
